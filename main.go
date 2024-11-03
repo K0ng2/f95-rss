@@ -2,20 +2,30 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/xml"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mmcdole/gofeed"
+	"github.com/robfig/cron/v3"
+	_ "modernc.org/sqlite"
 )
 
-const idFilePath = "f95_ids.txt" // Path to your text file containing the IDs
+var (
+	DBFILE  = os.Getenv("F95_RSS_DB")
+	IDFILE  = os.Getenv("F95_RSS_ID_FILE") // id.txt file
+	RSSCRON = os.Getenv("F95_RSS_CRON")
+)
 
 // RSS feed structures for XML serialization
 type RSS struct {
@@ -67,14 +77,7 @@ func readIDsFromFile(filePath string) ([]int, error) {
 }
 
 // Function to fetch data from the database based on the list of IDs
-func fetchDataFromDB(ids []int) ([]*Item, error) {
-	dbPath := os.Getenv("F95_DB_SQLITE")
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
+func fetchDataFromDB(db *sql.DB, ids []int) ([]*Item, error) {
 	var items []*Item
 
 	// Loop through each ID and execute a query for each one
@@ -110,14 +113,14 @@ func fetchDataFromDB(ids []int) ([]*Item, error) {
 }
 
 // Generate RSS feed with selected IDs
-func generateFeed(ids []int) (*RSS, error) {
+func generateFeed(db *sql.DB, ids []int) (*RSS, error) {
 	channel := &Channel{
 		Title:       "F95zone Latest Updates",
 		Link:        "https://f95zone.com/latest",
 		Description: "F95zone Adult Games - Latest Updates RSS Feed",
 	}
 
-	items, err := fetchDataFromDB(ids)
+	items, err := fetchDataFromDB(db, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -131,50 +134,166 @@ func generateFeed(ids []int) (*RSS, error) {
 }
 
 // Serve RSS feed
-func serveFeed(w http.ResponseWriter, r *http.Request) {
-	// Read IDs from file
-	ids, err := readIDsFromFile(idFilePath)
+func serveFeed(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Read IDs from file
+		ids, err := readIDsFromFile(IDFILE)
+		if err != nil {
+			http.Error(w, "Error reading IDs from file", http.StatusInternalServerError)
+			return
+		}
+
+		feed, err := generateFeed(db, ids)
+		if err != nil {
+			http.Error(w, "Error generating feed", http.StatusInternalServerError)
+			return
+		}
+
+		// Marshal the RSS feed into XML
+		rssXML, err := xml.MarshalIndent(feed, "", "  ")
+		if err != nil {
+			http.Error(w, "Error converting feed to XML", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/xml")
+		w.Write(rssXML)
+	}
+}
+
+func createDatabase(dbFile string) {
+	file, err := os.Create(dbFile)
 	if err != nil {
-		http.Error(w, "Error reading IDs from file", http.StatusInternalServerError)
-		return
+		log.Fatalf("Failed to create database file: %v", err)
+	}
+	file.Close()
+
+	db, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		log.Fatalf("Failed to open the new database: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		create table if not exists game (
+			id integer primary key,
+			name text,
+			version text,
+			creator text,
+			published integer,
+			imageUrl text
+		);
+	`)
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
 	}
 
-	feed, err := generateFeed(ids)
+	log.Println("Database and tables created successfully.")
+}
+
+type Game struct {
+	id        int
+	name      string
+	version   string
+	creator   string
+	publisher int64
+	imageUrl  string
+}
+
+func getFeed() *gofeed.Feed {
+	url := "https://f95zone.to/sam/latest_alpha/latest_data.php?cmd=rss&cat=games"
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	fp := gofeed.NewParser()
+	feed, err := fp.ParseURLWithContext(url, ctx)
 	if err != nil {
-		http.Error(w, "Error generating feed", http.StatusInternalServerError)
-		return
+		log.Fatalf("Error checking database file: %v", err)
 	}
 
-	// Marshal the RSS feed into XML
-	rssXML, err := xml.MarshalIndent(feed, "", "  ")
+	return feed
+}
+
+func parseData(data *gofeed.Item) *Game {
+	parsedURL, err := url.Parse(data.Link)
 	if err != nil {
-		http.Error(w, "Error converting feed to XML", http.StatusInternalServerError)
-		return
+		log.Println("Error parsing URL:", err)
 	}
 
-	w.Header().Set("Content-Type", "application/xml")
-	w.Write(rssXML)
+	id, err := strconv.Atoi(path.Base(parsedURL.Path))
+	if err != nil {
+		log.Printf("Error converting string to integer: %v\n", err)
+	}
+
+	re := regexp.MustCompile(`\] (?<name>.*?) \[(?<version>.+)\]`)
+	matches := re.FindStringSubmatch(data.Title)
+	name := re.SubexpIndex("name")
+	version := re.SubexpIndex("version")
+	return &Game{
+		id:        id,
+		name:      matches[name],
+		version:   matches[version],
+		creator:   data.DublinCoreExt.Creator[0],
+		publisher: data.PublishedParsed.Unix(),
+		imageUrl:  data.Image.URL,
+	}
+}
+
+func updateDatabase(db *sql.DB) {
+	feed := getFeed()
+	for _, f := range feed.Items {
+		stmt, err := db.Prepare("insert or replace into game values (?, ?, ?, ?, ?, ?)")
+		if err != nil {
+			log.Fatalf("failed to prepare statement: %v", err)
+		}
+		defer stmt.Close()
+
+		data := parseData(f)
+		_, err = stmt.Exec(data.id, data.name, data.version, data.creator, data.publisher, data.imageUrl)
+		if err != nil {
+			log.Fatalf("failed to insert game: %v", err)
+		}
+	}
+	log.Println("Update successfully")
 }
 
 func main() {
-	// Start HTTP server to serve the feed
-	http.HandleFunc("/feed", serveFeed)
-
-	go func() {
-		for {
-			ids, err := readIDsFromFile(idFilePath) // Read IDs from file every 30 minutes
-			if err != nil {
-				log.Println("Error reading IDs:", err)
-				continue
-			}
-			_, err = generateFeed(ids)
-			if err != nil {
-				log.Println("Error generating feed:", err)
-			}
-			time.Sleep(30 * time.Minute)
+	// Check if the database file exists
+	if _, err := os.Stat(DBFILE); err != nil {
+		if os.IsNotExist(err) {
+			log.Println("Database file does not exist, creating it...")
+			createDatabase(DBFILE)
+		} else {
+			log.Fatalf("Error checking database file: %v", err)
 		}
-	}()
+	} else {
+		log.Println("Database file already exists.")
+	}
 
-	fmt.Println("Serving feed on http://localhost:8080/feed")
+	db, err := sql.Open("sqlite", DBFILE)
+	if err != nil {
+		log.Fatalf("Failed to open the database: %v", err)
+	}
+	defer db.Close()
+
+	// Start HTTP server to serve the feed
+	http.HandleFunc("/feed", serveFeed(db))
+
+	c := cron.New()
+
+	c.AddFunc(RSSCRON, func() {
+		updateDatabase(db)
+		ids, err := readIDsFromFile(IDFILE) // Read IDs from file every 30 minutes
+		if err != nil {
+			log.Fatalf("Error reading IDs: %v", err)
+		}
+		_, err = generateFeed(db, ids)
+		if err != nil {
+			log.Println("Error generating feed:", err)
+		}
+	})
+
+	c.Start()
+
+	log.Println("Serving feed on http://localhost:8080/feed")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
