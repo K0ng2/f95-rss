@@ -1,0 +1,13 @@
+services:
+  server:
+    container_name: f95-rss
+    expose:
+      - 8080
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./app:/app
+    restart: always
+    env_file:
+      - .env
