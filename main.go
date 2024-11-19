@@ -219,6 +219,8 @@ func updateDatabase(db *sql.DB) {
 		insertGame(db, f.ThreadID, f.Title, f.Version, creatorID)
 		insertCover(db, f.ThreadID, f.Cover)
 		insertPreview(db, f.ThreadID, f.Screens)
+		insertTags(db, f.ThreadID, f.Tags)
+		insertPrefixes(db, f.ThreadID, f.Prefixes)
 	}
 	log.Println("Update successfully")
 }
@@ -278,6 +280,28 @@ func insertPreview(db *sql.DB, gameID int, previewURL []string) {
 	}
 }
 
+func insertTags(db *sql.DB, gameID int, Tags []int) {
+	query := `insert or ignore into tags (game_id, tag_id) values (?, ?);`
+
+	for _, s := range Tags {
+		_, err := db.Exec(query, gameID, s)
+		if err != nil {
+			log.Fatalf("failed to insert Tags: %v", err)
+		}
+	}
+}
+
+func insertPrefixes(db *sql.DB, gameID int, Prefixes []int) {
+	query := `insert or ignore into prefixes (game_id, prefix_id) values (?, ?);`
+
+	for _, s := range Prefixes {
+		_, err := db.Exec(query, gameID, s)
+		if err != nil {
+			log.Fatalf("failed to insert Prefixes: %v", err)
+		}
+	}
+}
+
 func createDatabase(dbFile string) {
 	file, err := os.Create(dbFile)
 	if err != nil {
@@ -318,6 +342,20 @@ func createDatabase(dbFile string) {
 			id integer primary key autoincrement,
 			url text not null unique,
 			game_id integer,
+			foreign key(game_id) references game(id)
+		);
+
+		create table if not exists tags (
+			game_id integer,
+			tag_id integer,
+			PRIMARY KEY(game_id, tag_id),
+			foreign key(game_id) references game(id)
+		);
+
+		create table if not exists prefixes (
+			game_id integer,
+			prefix_id integer,
+			PRIMARY KEY(game_id, prefix_id),
 			foreign key(game_id) references game(id)
 		);
 
