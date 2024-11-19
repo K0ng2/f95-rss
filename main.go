@@ -301,8 +301,8 @@ func createDatabase(dbFile string) {
 			id integer primary key,
 			title text not null,
 			version text,
-			created timestamp default current_timestamp,
-			updated timestamp default current_timestamp,
+			created timestamp default (datetime(current_timestamp, 'localtime')),
+			updated timestamp default (datetime(current_timestamp, 'localtime')),
 			creator_id integer,
 			foreign key(creator_id) references creator(id)
 		);
