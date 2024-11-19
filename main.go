@@ -128,7 +128,7 @@ func fetchDataFromDB(db *sql.DB, ids []int) ([]*Item, error) {
 			log.Fatalf("Failed to get the coverURL of id %d: %v", gameID, err)
 		}
 
-		link := fmt.Sprintf("https://f95zone.to/threads/(%d)", gameID)
+		link := fmt.Sprintf("https://f95zone.to/threads/%d", gameID)
 
 		t, err := time.Parse(time.RFC3339, updated)
 		if err != nil {
@@ -140,7 +140,7 @@ func fetchDataFromDB(db *sql.DB, ids []int) ([]*Item, error) {
 			Title:       fmt.Sprintf("%s [%s]", title, version),
 			Link:        link,
 			Description: "<img src=\"" + coverURL + "\" alt=\"" + title + "\" />",
-			PubDate:     t,
+			PubDate:     t.Local(),
 		}
 		items = append(items, item)
 	}
