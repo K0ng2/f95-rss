@@ -2,24 +2,22 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"database/sql"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/mmcdole/gofeed"
 	"github.com/robfig/cron/v3"
 	_ "modernc.org/sqlite"
 )
+
+const BASE_API = "https://f95zone.to/sam/latest_alpha/latest_data.php?cmd=list&cat=games"
 
 var (
 	DBFILE  = os.Getenv("F95_RSS_DB")
@@ -46,6 +44,31 @@ type Item struct {
 	Link        string    `xml:"link"`
 	Description string    `xml:"description"`
 	PubDate     time.Time `xml:"pubDate"`
+}
+
+type F95 struct {
+	Status string `json:"status"`
+	Msg    struct {
+		Data []F95DATA `json:"data"`
+	} `json:"msg"`
+}
+
+type F95DATA struct {
+	ThreadID int    `json:"thread_id"`
+	Title    string `json:"title"`
+	Creator  string `json:"creator"`
+	Version  string `json:"version"`
+	// Views    int      `json:"views"`
+	// Likes    int      `json:"likes"`
+	Prefixes []int `json:"prefixes"`
+	Tags     []int `json:"tags"`
+	// Rating   int      `json:"rating"`
+	Cover   string   `json:"cover"`
+	Screens []string `json:"screens"`
+	// Date     string   `json:"date"`
+	// Watched  bool     `json:"watched"`
+	// Ignored  bool     `json:"ignored"`
+	// New      bool     `json:"new"`
 }
 
 // Read IDs from a plain text file, one per line
@@ -82,14 +105,14 @@ func fetchDataFromDB(db *sql.DB, ids []int) ([]*Item, error) {
 
 	// Loop through each ID and execute a query for each one
 	for _, id := range ids {
-		query := "SELECT * FROM game WHERE id = ?"
-		row := db.QueryRow(query, id)
+		gameQuery := "SELECT id, title, version, updated FROM game WHERE id = ?"
+		game := db.QueryRow(gameQuery, id)
 
-		var published int64
-		var idStr, name, version, creator, imageUrl string
+		var gameID int
+		var title, version, updated string
 
 		// Fetch data from the row
-		err := row.Scan(&idStr, &name, &version, &creator, &published, &imageUrl)
+		err := game.Scan(&gameID, &title, &version, &updated)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				// If no rows are returned, skip this ID
@@ -98,13 +121,26 @@ func fetchDataFromDB(db *sql.DB, ids []int) ([]*Item, error) {
 			return nil, err
 		}
 
-		link := "https://f95zone.to/threads/" + idStr
+		var coverURL string
+		coverQuery := "select url from cover where game_id = ? order by desc limit 1;"
+		err = db.QueryRow(coverQuery, gameID).Scan(&coverURL)
+		if err != nil {
+			log.Fatalf("Failed to get the coverURL: %v", err)
+		}
+
+		link := fmt.Sprintf("https://f95zone.to/threads/(%d)", gameID)
+
+		t, err := time.Parse(time.RFC3339, updated)
+		if err != nil {
+			log.Fatalf("Error parsing time: %v", err)
+		}
+
 		// Create a feed item and add it to the list
 		item := &Item{
-			Title:       fmt.Sprintf("%s [%s]", name, version),
+			Title:       fmt.Sprintf("%s [%s]", title, version),
 			Link:        link,
-			Description: "<img src=\"" + imageUrl + "\" alt=\"" + name + "\" />",
-			PubDate:     time.Unix(published, 0),
+			Description: "<img src=\"" + coverURL + "\" alt=\"" + title + "\" />",
+			PubDate:     t,
 		}
 		items = append(items, item)
 	}
@@ -161,6 +197,87 @@ func serveFeed(db *sql.DB) http.HandlerFunc {
 	}
 }
 
+func getData() (data F95) {
+	req, err := http.Get(BASE_API)
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+
+	defer req.Body.Close()
+
+	if err = json.NewDecoder(req.Body).Decode(&data); err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+
+	return data
+}
+
+func updateDatabase(db *sql.DB) {
+	data := getData()
+	for _, f := range data.Msg.Data {
+		creatorID := insertCreator(db, f.Creator)
+		insertGame(db, f.ThreadID, f.Title, f.Version, creatorID)
+		insertCover(db, f.ThreadID, f.Cover)
+		insertPreview(db, f.ThreadID, f.Screens)
+	}
+	log.Println("Update successfully")
+}
+
+func insertCreator(db *sql.DB, creator string) int {
+	var id int
+	query := `
+		INSERT INTO creator (name)
+		VALUES (?)
+		ON CONFLICT (name) DO UPDATE SET name = name
+		RETURNING id;
+	`
+
+	err := db.QueryRow(query, creator).Scan(&id)
+	if err != nil {
+		log.Fatalf("failed to insert creator: %v", err)
+	}
+
+	return id
+}
+
+func insertGame(db *sql.DB, id int, title string, version string, creatorId int) {
+	query := `
+		insert into game (
+			id, title, version, creator_id
+		) values (?, ?, ?, ?)
+		on conflict (id) do update set
+			title = excluded.title,
+			version = excluded.version,
+			creator_id = excluded.creator_id
+		;
+	`
+
+	_, err := db.Exec(query, id, title, version, creatorId)
+	if err != nil {
+		log.Fatalf("failed to insert game: %v", err)
+	}
+}
+
+func insertCover(db *sql.DB, gameID int, coverURL string) {
+	query := `insert or ignore into cover (url, game_id) values (?, ?);`
+
+	_, err := db.Exec(query, coverURL, gameID)
+	if err != nil {
+		log.Fatalf("failed to insert cover: %v", err)
+	}
+}
+
+func insertPreview(db *sql.DB, gameID int, previewURL []string) {
+	query := `insert or ignore into preview (url, game_id) values (?, ?);`
+
+	for _, s := range previewURL {
+		_, err := db.Exec(query, s, gameID)
+		if err != nil {
+			log.Fatalf("failed to insert preview: %v", err)
+		}
+	}
+}
+
 func createDatabase(dbFile string) {
 	file, err := os.Create(dbFile)
 	if err != nil {
@@ -175,85 +292,49 @@ func createDatabase(dbFile string) {
 	defer db.Close()
 
 	_, err = db.Exec(`
+		create table if not exists creator (
+			id integer primary key AUTOINCREMENT,
+			name text not null unique
+		);
+
 		create table if not exists game (
 			id integer primary key,
-			name text,
+			title text not null,
 			version text,
-			creator text,
-			published integer,
-			imageUrl text
+			created timestamp default current_timestamp,
+			updated timestamp default current_timestamp,
+			creator_id integer,
+			foreign key(creator_id) references creator(id)
 		);
+
+		create table if not exists cover (
+			id integer primary key autoincrement,
+			url text not null unique,
+			game_id integer,
+			foreign key(game_id) references game(id)
+		);
+
+		create table if not exists preview (
+			id integer primary key autoincrement,
+			url text not null unique,
+			game_id integer,
+			foreign key(game_id) references game(id)
+		);
+
+		create trigger if not exists update_timestamp
+		after update on game
+		for each row
+		begin
+			update game
+			set updated = current_timestamp
+			where id = old.id;
+		end;
 	`)
 	if err != nil {
 		log.Fatalf("Failed to create table: %v", err)
 	}
 
 	log.Println("Database and tables created successfully.")
-}
-
-type Game struct {
-	id        int
-	name      string
-	version   string
-	creator   string
-	publisher int64
-	imageUrl  string
-}
-
-func getFeed() *gofeed.Feed {
-	url := "https://f95zone.to/sam/latest_alpha/latest_data.php?cmd=rss&cat=games"
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	fp := gofeed.NewParser()
-	feed, err := fp.ParseURLWithContext(url, ctx)
-	if err != nil {
-		log.Fatalf("Error checking database file: %v", err)
-	}
-
-	return feed
-}
-
-func parseData(data *gofeed.Item) *Game {
-	parsedURL, err := url.Parse(data.Link)
-	if err != nil {
-		log.Println("Error parsing URL:", err)
-	}
-
-	id, err := strconv.Atoi(path.Base(parsedURL.Path))
-	if err != nil {
-		log.Printf("Error converting string to integer: %v\n", err)
-	}
-
-	re := regexp.MustCompile(`\] (?<name>.*?) \[(?<version>.+)\]`)
-	matches := re.FindStringSubmatch(data.Title)
-	name := re.SubexpIndex("name")
-	version := re.SubexpIndex("version")
-	return &Game{
-		id:        id,
-		name:      matches[name],
-		version:   matches[version],
-		creator:   data.DublinCoreExt.Creator[0],
-		publisher: data.PublishedParsed.Unix(),
-		imageUrl:  data.Image.URL,
-	}
-}
-
-func updateDatabase(db *sql.DB) {
-	feed := getFeed()
-	for _, f := range feed.Items {
-		stmt, err := db.Prepare("insert or replace into game values (?, ?, ?, ?, ?, ?)")
-		if err != nil {
-			log.Fatalf("failed to prepare statement: %v", err)
-		}
-		defer stmt.Close()
-
-		data := parseData(f)
-		_, err = stmt.Exec(data.id, data.name, data.version, data.creator, data.publisher, data.imageUrl)
-		if err != nil {
-			log.Fatalf("failed to insert game: %v", err)
-		}
-	}
-	log.Println("Update successfully")
 }
 
 func main() {
