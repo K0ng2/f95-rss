@@ -122,10 +122,10 @@ func fetchDataFromDB(db *sql.DB, ids []int) ([]*Item, error) {
 		}
 
 		var coverURL string
-		coverQuery := "select url from cover where game_id = ? order by desc limit 1;"
+		coverQuery := "select url from cover where game_id = ? order by id desc limit 1;"
 		err = db.QueryRow(coverQuery, gameID).Scan(&coverURL)
 		if err != nil {
-			log.Fatalf("Failed to get the coverURL: %v", err)
+			log.Fatalf("Failed to get the coverURL of id %d: %v", gameID, err)
 		}
 
 		link := fmt.Sprintf("https://f95zone.to/threads/(%d)", gameID)
